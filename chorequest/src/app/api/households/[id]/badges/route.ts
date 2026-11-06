@@ -1,14 +1,10 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
-import { z } from "zod";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { hasPermission } from "@/lib/permissions";
 
 type Params = { params: { id: string } };
 
-// GET /api/households/[id]/badges
-// Returns all system badges + household custom badges with their winners
 export async function GET(_req: Request, { params }: Params) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
@@ -27,6 +23,7 @@ export async function GET(_req: Request, { params }: Params) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
+  // System badges (householdId = null) + this household's custom badges
   const badges = await prisma.badge.findMany({
     where: {
       OR: [{ householdId: null }, { householdId: params.id }],
@@ -44,44 +41,25 @@ export async function GET(_req: Request, { params }: Params) {
         where: { householdId: params.id },
         select: {
           id: true,
+          userId: true,
           awardedAt: true,
           expiresAt: true,
-          user: { select: { id: true, name: true } },
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatarColour: true,
+            },
+          },
         },
       },
     },
     orderBy: [{ type: "asc" }, { name: "asc" }],
   });
 
-  const data = badges.map((badge) => ({
-    id: badge.id,
-    name: badge.name,
-    description: badge.description,
-    icon: badge.icon,
-    type: badge.type,
-    isNegative: badge.isNegative,
-    householdId: badge.householdId,
-    awardCondition: badge.awardCondition,
-    winners: badge.userBadges.map((ub) => ({
-      userId: ub.user.id,
-      userName: ub.user.name,
-      awardedAt: ub.awardedAt,
-      expiresAt: ub.expiresAt,
-    })),
-  }));
-
-  return NextResponse.json({ data });
+  return NextResponse.json({ data: badges });
 }
 
-const createBadgeSchema = z.object({
-  name: z.string().min(1),
-  description: z.string(),
-  icon: z.string().max(2),
-  awardCondition: z.string().optional(),
-});
-
-// POST /api/households/[id]/badges
-// Create a custom badge for this household (OWNER/ADMIN or canAwardBadges)
 export async function POST(req: Request, { params }: Params) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
@@ -100,28 +78,36 @@ export async function POST(req: Request, { params }: Params) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  if (!hasPermission(membership, "canAwardBadges")) {
+  if (membership.role !== "OWNER" && membership.role !== "ADMIN") {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  const body: unknown = await req.json();
-  const parsed = createBadgeSchema.safeParse(body);
-  if (!parsed.success) {
-    return NextResponse.json({ error: parsed.error.message }, { status: 400 });
-  }
+  const body: {
+    name?: string;
+    description?: string;
+    icon?: string;
+    awardCondition?: string;
+  } = await req.json();
 
-  const { name, description, icon, awardCondition } = parsed.data;
+  if (!body.name || !body.description || !body.icon) {
+    return NextResponse.json(
+      { error: "name, description, and icon are required" },
+      { status: 400 }
+    );
+  }
 
   const badge = await prisma.badge.create({
     data: {
-      name,
-      description,
-      icon,
+      name: body.name,
+      description: body.description,
+      icon: body.icon,
       type: "CUSTOM",
+      isNegative: false,
       householdId: params.id,
-      awardCondition: awardCondition ?? null,
+      awardCondition: body.awardCondition ?? null,
     },
   });
 
   return NextResponse.json({ data: badge }, { status: 201 });
 }
+

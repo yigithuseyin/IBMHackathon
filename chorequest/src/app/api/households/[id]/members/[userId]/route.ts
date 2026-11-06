@@ -1,10 +1,48 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { z } from "zod";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { hasPermission } from "@/lib/permissions";
+import { hasPermission, MemberPermissions } from "@/lib/permissions";
 
 type Params = { params: { id: string; userId: string } };
+
+const patchSchema = z.object({
+  role: z.enum(["ADMIN", "MEMBER", "OWNER"]).optional(),
+  permissions: z
+    .object({
+      canCreateChores: z.boolean().optional(),
+      canAssignChores: z.boolean().optional(),
+      canApproveCompletions: z.boolean().optional(),
+      canAwardBadges: z.boolean().optional(),
+      canManageMembers: z.boolean().optional(),
+      canSetExempt: z.boolean().optional(),
+    })
+    .optional(),
+  isExempt: z.boolean().optional(),
+});
+
+function parsePermissions(raw: unknown): MemberPermissions {
+  const defaults: MemberPermissions = {
+    canCreateChores: false,
+    canAssignChores: false,
+    canApproveCompletions: false,
+    canAwardBadges: false,
+    canManageMembers: false,
+    canSetExempt: false,
+  };
+  try {
+    if (typeof raw === "string") {
+      return { ...defaults, ...(JSON.parse(raw) as Partial<MemberPermissions>) };
+    }
+    if (typeof raw === "object" && raw !== null) {
+      return { ...defaults, ...(raw as Partial<MemberPermissions>) };
+    }
+  } catch {
+    // malformed — return defaults
+  }
+  return defaults;
+}
 
 export async function PATCH(req: Request, { params }: Params) {
   const session = await getServerSession(authOptions);
@@ -12,148 +50,105 @@ export async function PATCH(req: Request, { params }: Params) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const requesterMembership = await prisma.householdMember.findUnique({
+  const requester = await prisma.householdMember.findUnique({
     where: {
-      householdId_userId: {
-        householdId: params.id,
-        userId: session.user.id,
-      },
+      householdId_userId: { householdId: params.id, userId: session.user.id },
     },
   });
-  if (!requesterMembership) {
+  if (!requester) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  if (
-    !hasPermission(requesterMembership, "canManageMembers") &&
-    !hasPermission(requesterMembership, "canSetExempt")
-  ) {
+  if (!hasPermission(requester, "canManageMembers")) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  const targetMembership = await prisma.householdMember.findUnique({
+  const target = await prisma.householdMember.findUnique({
     where: {
-      householdId_userId: {
-        householdId: params.id,
-        userId: params.userId,
-      },
+      householdId_userId: { householdId: params.id, userId: params.userId },
     },
   });
-  if (!targetMembership) {
+  if (!target) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const body: unknown = await req.json();
-  const { role, permissions, isExempt } = body as {
-    role?: string;
-    permissions?: object;
-    isExempt?: boolean;
-  };
+  const parsed = patchSchema.safeParse(await req.json());
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: parsed.error.errors[0]?.message ?? "Invalid input" },
+      { status: 400 }
+    );
+  }
+  const { role, permissions, isExempt } = parsed.data;
 
-  // Cannot demote the Owner
-  if (targetMembership.role === "OWNER" && role && role !== "OWNER") {
+  // Hierarchy rules
+  if (target.role === "OWNER" && role !== undefined) {
     return NextResponse.json(
       { error: "Cannot demote the Owner" },
       { status: 403 }
     );
   }
-
-  // Cannot promote to Owner unless requester is Owner
-  if (role === "OWNER" && requesterMembership.role !== "OWNER") {
+  if (requester.role === "ADMIN" && role === "OWNER") {
     return NextResponse.json(
       { error: "Only the Owner can transfer ownership" },
       { status: 403 }
     );
   }
 
-  const updated = await prisma.householdMember.update({
+  // Merge permissions with existing
+  let mergedPermissionsJson: string | undefined;
+  if (permissions !== undefined) {
+    const existing = parsePermissions(target.permissions);
+    const merged: MemberPermissions = { ...existing, ...permissions } as MemberPermissions;
+    mergedPermissionsJson = JSON.stringify(merged);
+  }
+
+  await prisma.householdMember.update({
     where: {
-      householdId_userId: {
-        householdId: params.id,
-        userId: params.userId,
-      },
+      householdId_userId: { householdId: params.id, userId: params.userId },
     },
     data: {
       ...(role !== undefined ? { role } : {}),
-      ...(permissions !== undefined
-        ? { permissions: JSON.stringify(permissions) }
+      ...(mergedPermissionsJson !== undefined
+        ? { permissions: mergedPermissionsJson }
         : {}),
       ...(isExempt !== undefined ? { isExempt } : {}),
     },
-    select: {
-      id: true,
-      role: true,
-      permissions: true,
-      isExempt: true,
-      joinedAt: true,
-      user: {
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          avatarColour: true,
-          totalPoints: true,
-        },
-      },
-    },
   });
 
-  // Handle Exempt badge
+  // Handle Exempt badge (system badge — householdId null)
   if (isExempt !== undefined) {
     const EXEMPT_BADGE_NAME = "Exempt 🛡️";
+    const exemptBadge = await prisma.badge.findFirst({
+      where: { name: EXEMPT_BADGE_NAME },
+      select: { id: true },
+    });
 
-    if (isExempt) {
-      // Find or create the Exempt badge for this household
-      let badge = await prisma.badge.findFirst({
-        where: { name: EXEMPT_BADGE_NAME, householdId: params.id },
-        select: { id: true },
-      });
-
-      if (!badge) {
-        badge = await prisma.badge.create({
-          data: {
-            name: EXEMPT_BADGE_NAME,
-            description: "This member is exempt from chore requirements.",
-            icon: "🛡️",
-            type: "TEMPORARY",
+    if (exemptBadge) {
+      if (isExempt) {
+        const existing = await prisma.userBadge.findFirst({
+          where: {
+            userId: params.userId,
+            badgeId: exemptBadge.id,
             householdId: params.id,
           },
           select: { id: true },
         });
-      }
-
-      // Upsert the UserBadge (find or create)
-      const existing = await prisma.userBadge.findFirst({
-        where: {
-          userId: params.userId,
-          badgeId: badge.id,
-          householdId: params.id,
-        },
-        select: { id: true },
-      });
-
-      if (!existing) {
-        await prisma.userBadge.create({
-          data: {
-            userId: params.userId,
-            badgeId: badge.id,
-            householdId: params.id,
-            awardedByUserId: session.user.id,
-          },
-        });
-      }
-    } else {
-      // Remove the Exempt badge UserBadge record
-      const badge = await prisma.badge.findFirst({
-        where: { name: EXEMPT_BADGE_NAME, householdId: params.id },
-        select: { id: true },
-      });
-
-      if (badge) {
+        if (!existing) {
+          await prisma.userBadge.create({
+            data: {
+              userId: params.userId,
+              badgeId: exemptBadge.id,
+              householdId: params.id,
+              awardedByUserId: session.user.id,
+            },
+          });
+        }
+      } else {
         await prisma.userBadge.deleteMany({
           where: {
             userId: params.userId,
-            badgeId: badge.id,
+            badgeId: exemptBadge.id,
             householdId: params.id,
           },
         });
@@ -161,7 +156,7 @@ export async function PATCH(req: Request, { params }: Params) {
     }
   }
 
-  return NextResponse.json({ data: updated });
+  return NextResponse.json({ data: { updated: true } });
 }
 
 export async function DELETE(_req: Request, { params }: Params) {
@@ -170,45 +165,53 @@ export async function DELETE(_req: Request, { params }: Params) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const requesterMembership = await prisma.householdMember.findUnique({
+  const requester = await prisma.householdMember.findUnique({
     where: {
-      householdId_userId: {
-        householdId: params.id,
-        userId: session.user.id,
-      },
+      householdId_userId: { householdId: params.id, userId: session.user.id },
     },
   });
-  if (!requesterMembership) {
+  if (!requester) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  if (!hasPermission(requesterMembership, "canManageMembers")) {
+  if (!hasPermission(requester, "canManageMembers")) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  const targetMembership = await prisma.householdMember.findUnique({
+  // Cannot remove yourself
+  if (params.userId === session.user.id) {
+    return NextResponse.json(
+      { error: "Cannot remove yourself" },
+      { status: 403 }
+    );
+  }
+
+  const target = await prisma.householdMember.findUnique({
     where: {
-      householdId_userId: {
-        householdId: params.id,
-        userId: params.userId,
-      },
+      householdId_userId: { householdId: params.id, userId: params.userId },
     },
     select: { id: true, role: true },
   });
-  if (!targetMembership) {
+  if (!target) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  if (targetMembership.role === "OWNER") {
+  if (target.role === "OWNER") {
     return NextResponse.json(
       { error: "Cannot remove the Owner" },
       { status: 403 }
     );
   }
 
-  await prisma.householdMember.delete({
-    where: { id: targetMembership.id },
-  });
+  await prisma.$transaction([
+    prisma.householdMember.delete({ where: { id: target.id } }),
+    prisma.userStreak.deleteMany({
+      where: { userId: params.userId, householdId: params.id },
+    }),
+    prisma.userBadge.deleteMany({
+      where: { userId: params.userId, householdId: params.id },
+    }),
+  ]);
 
-  return NextResponse.json({ data: { success: true } });
+  return NextResponse.json({ data: { removed: true } });
 }

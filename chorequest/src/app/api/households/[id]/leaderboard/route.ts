@@ -34,11 +34,17 @@ export async function GET(_req: Request, { params }: Params) {
           totalPoints: true,
           streaks: {
             where: { householdId: params.id },
-            select: { currentStreak: true, longestStreak: true },
+            select: { currentStreak: true },
           },
           badges: {
             where: { householdId: params.id },
-            select: { id: true },
+            select: {
+              id: true,
+              badge: {
+                select: { icon: true, name: true, isNegative: true },
+              },
+            },
+            orderBy: { awardedAt: "desc" },
           },
         },
       },
@@ -55,8 +61,12 @@ export async function GET(_req: Request, { params }: Params) {
       avatarColour: m.user.avatarColour,
       totalPoints: m.user.totalPoints,
       currentStreak: streak?.currentStreak ?? 0,
-      longestStreak: streak?.longestStreak ?? 0,
       badgeCount: m.user.badges.length,
+      topBadges: m.user.badges.slice(0, 3).map((ub) => ({
+        icon: ub.badge.icon,
+        name: ub.badge.name,
+        isNegative: ub.badge.isNegative,
+      })),
     };
   });
 

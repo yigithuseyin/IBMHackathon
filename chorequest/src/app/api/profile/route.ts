@@ -9,8 +9,10 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const userId = session.user.id;
+
   const user = await prisma.user.findUnique({
-    where: { id: session.user.id },
+    where: { id: userId },
     select: {
       id: true,
       name: true,
@@ -18,8 +20,8 @@ export async function GET() {
       avatarColour: true,
       totalPoints: true,
       completions: {
-        where: { completedByUserId: session.user.id },
-        select: { id: true },
+        where: { completedByUserId: userId },
+        select: { id: true, householdId: true, pointsAwarded: true },
       },
       badges: {
         select: {
@@ -40,7 +42,18 @@ export async function GET() {
         },
       },
       streaks: {
-        select: { longestStreak: true },
+        select: {
+          householdId: true,
+          currentStreak: true,
+          longestStreak: true,
+          household: { select: { name: true } },
+        },
+      },
+      households: {
+        select: {
+          householdId: true,
+          household: { select: { name: true } },
+        },
       },
     },
   });
@@ -54,24 +67,44 @@ export async function GET() {
     (max, s) => Math.max(max, s.longestStreak),
     0
   );
-  const badgesEarned = user.badges.length;
+
+  // Build per-household stats
+  const householdStats = user.households.map((hm) => {
+    const hid = hm.householdId;
+    const householdCompletions = user.completions.filter(
+      (c) => c.householdId === hid
+    );
+    const streak = user.streaks.find((s) => s.householdId === hid);
+    return {
+      householdId: hid,
+      householdName: hm.household.name,
+      points: householdCompletions.reduce((sum, c) => sum + c.pointsAwarded, 0),
+      choresCompleted: householdCompletions.length,
+      currentStreak: streak?.currentStreak ?? 0,
+      longestStreak: streak?.longestStreak ?? 0,
+    };
+  });
+
+  const allBadges = user.badges.map((ub) => ({
+    id: ub.id,
+    icon: ub.badge.icon,
+    name: ub.badge.name,
+    type: ub.badge.type,
+    isNegative: ub.badge.isNegative,
+    householdName: ub.household?.name ?? null,
+    awardedAt: ub.awardedAt,
+  }));
 
   return NextResponse.json({
     data: {
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        avatarColour: user.avatarColour,
-        totalPoints: user.totalPoints,
-      },
-      stats: {
-        totalChoresCompleted,
-        totalPointsAllTime: user.totalPoints,
-        longestStreakEver,
-        badgesEarned,
-      },
-      badges: user.badges,
+      name: user.name,
+      email: user.email,
+      avatarColour: user.avatarColour,
+      totalPoints: user.totalPoints,
+      totalChoresCompleted,
+      longestStreakEver,
+      allBadges,
+      householdStats,
     },
   });
 }

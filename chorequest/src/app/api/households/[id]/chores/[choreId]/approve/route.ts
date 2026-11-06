@@ -3,6 +3,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { hasPermission } from "@/lib/permissions";
+import { checkAndAwardBadges } from "@/lib/badges";
 
 type Params = { params: { id: string; choreId: string } };
 
@@ -79,6 +80,9 @@ export async function POST(_req: Request, { params }: Params) {
 
     return [updated];
   });
+
+  // Award badges after the transaction — non-blocking
+  void checkAndAwardBadges(pendingCompletion.completedByUserId, params.id).catch(() => {});
 
   return NextResponse.json({ data: { completion } });
 }

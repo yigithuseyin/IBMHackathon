@@ -16,8 +16,10 @@ export default async function ProfilePage() {
     redirect("/login");
   }
 
+  const userId = session.user.id;
+
   const user = await prisma.user.findUnique({
-    where: { id: session.user.id },
+    where: { id: userId },
     select: {
       id: true,
       name: true,
@@ -25,8 +27,8 @@ export default async function ProfilePage() {
       avatarColour: true,
       totalPoints: true,
       completions: {
-        where: { completedByUserId: session.user.id },
-        select: { id: true },
+        where: { completedByUserId: userId },
+        select: { id: true, householdId: true, pointsAwarded: true },
       },
       badges: {
         select: {
@@ -48,7 +50,17 @@ export default async function ProfilePage() {
         orderBy: { awardedAt: "desc" },
       },
       streaks: {
-        select: { longestStreak: true },
+        select: {
+          householdId: true,
+          currentStreak: true,
+          longestStreak: true,
+        },
+      },
+      households: {
+        select: {
+          householdId: true,
+          household: { select: { name: true } },
+        },
       },
     },
   });
@@ -64,22 +76,37 @@ export default async function ProfilePage() {
   );
   const badgesEarned = user.badges.length;
 
+  // Per-household stats
+  const householdStats = user.households.map((hm) => {
+    const hid = hm.householdId;
+    const hCompletions = user.completions.filter((c) => c.householdId === hid);
+    const streak = user.streaks.find((s) => s.householdId === hid);
+    return {
+      householdId: hid,
+      householdName: hm.household.name,
+      points: hCompletions.reduce((sum, c) => sum + c.pointsAwarded, 0),
+      choresCompleted: hCompletions.length,
+      currentStreak: streak?.currentStreak ?? 0,
+      longestStreak: streak?.longestStreak ?? 0,
+    };
+  });
+
   // Group badges by type
-  const badgesByType: Record<
-    string,
-    typeof user.badges
-  > = {};
+  const badgesByType: Record<string, typeof user.badges> = {};
   for (const ub of user.badges) {
     const type = ub.badge.type;
     if (!badgesByType[type]) badgesByType[type] = [];
     badgesByType[type].push(ub);
   }
 
-  const stats = [
+  const statCards = [
     { label: "Total Points", value: user.totalPoints.toLocaleString() },
     { label: "Chores Completed", value: totalChoresCompleted.toLocaleString() },
-    { label: "Longest Streak", value: longestStreakEver > 0 ? `${longestStreakEver} days` : "—" },
-    { label: "Badges Earned", value: badgesEarned.toLocaleString() },
+    {
+      label: "Longest Streak",
+      value: longestStreakEver > 0 ? `${longestStreakEver} days` : "—",
+    },
+    { label: "Households", value: user.households.length.toLocaleString() },
   ];
 
   return (
@@ -100,7 +127,7 @@ export default async function ProfilePage() {
 
       {/* Stats cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10">
-        {stats.map((stat) => (
+        {statCards.map((stat) => (
           <div
             key={stat.label}
             className="bg-white rounded-xl border border-gray-200 p-4 text-center"
@@ -113,10 +140,63 @@ export default async function ProfilePage() {
         ))}
       </div>
 
+      {/* Household Breakdown */}
+      {householdStats.length > 0 && (
+        <div className="mb-10">
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">
+            Household Breakdown
+          </h2>
+          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b border-gray-200">
+                <tr>
+                  <th className="px-4 py-3 text-left font-semibold text-gray-600">
+                    Household
+                  </th>
+                  <th className="px-4 py-3 text-right font-semibold text-gray-600">
+                    Points
+                  </th>
+                  <th className="px-4 py-3 text-right font-semibold text-gray-600">
+                    Chores
+                  </th>
+                  <th className="px-4 py-3 text-right font-semibold text-gray-600">
+                    Streak
+                  </th>
+                  <th className="px-4 py-3 text-right font-semibold text-gray-600">
+                    Best Streak
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {householdStats.map((hs) => (
+                  <tr key={hs.householdId} className="hover:bg-gray-50">
+                    <td className="px-4 py-3 font-medium text-gray-900">
+                      {hs.householdName}
+                    </td>
+                    <td className="px-4 py-3 text-right text-gray-700">
+                      {hs.points.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-3 text-right text-gray-700">
+                      {hs.choresCompleted}
+                    </td>
+                    <td className="px-4 py-3 text-right text-gray-700">
+                      {hs.currentStreak > 0 ? `🔥 ${hs.currentStreak}` : "—"}
+                    </td>
+                    <td className="px-4 py-3 text-right text-gray-700">
+                      {hs.longestStreak > 0 ? `${hs.longestStreak} days` : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Badges */}
       <div>
         <h2 className="text-lg font-semibold text-gray-900 mb-4">
-          Badges {badgesEarned > 0 && `(${badgesEarned})`}
+          My Badges {badgesEarned > 0 && `(${badgesEarned})`}
         </h2>
 
         {badgesEarned === 0 ? (

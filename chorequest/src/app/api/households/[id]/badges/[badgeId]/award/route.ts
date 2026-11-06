@@ -1,17 +1,10 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
-import { z } from "zod";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { hasPermission } from "@/lib/permissions";
-import { awardCustomBadge } from "@/lib/badges";
 
 type Params = { params: { id: string; badgeId: string } };
-
-const awardSchema = z.object({
-  userId: z.string(),
-  expiresAt: z.string().datetime().optional(),
-});
 
 export async function POST(req: Request, { params }: Params) {
   const session = await getServerSession(authOptions);
@@ -35,19 +28,32 @@ export async function POST(req: Request, { params }: Params) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  const body: unknown = await req.json();
-  const parsed = awardSchema.safeParse(body);
-  if (!parsed.success) {
-    return NextResponse.json({ error: parsed.error.message }, { status: 400 });
+  const badge = await prisma.badge.findUnique({
+    where: { id: params.badgeId },
+    select: { id: true, householdId: true },
+  });
+  if (!badge) {
+    return NextResponse.json({ error: "Badge not found" }, { status: 404 });
+  }
+  // Badge must be a system badge or belong to this household
+  if (badge.householdId !== null && badge.householdId !== params.id) {
+    return NextResponse.json({ error: "Badge not found" }, { status: 404 });
   }
 
-  const { userId, expiresAt } = parsed.data;
+  const body: { userId?: string; expiresAt?: string } = await req.json();
+  if (!body.userId) {
+    return NextResponse.json({ error: "userId is required" }, { status: 400 });
+  }
 
-  // Verify the target user is a member of this household
+  // Confirm the target user is a member of this household
   const targetMembership = await prisma.householdMember.findUnique({
     where: {
-      householdId_userId: { householdId: params.id, userId },
+      householdId_userId: {
+        householdId: params.id,
+        userId: body.userId,
+      },
     },
+    select: { id: true },
   });
   if (!targetMembership) {
     return NextResponse.json(
@@ -56,18 +62,38 @@ export async function POST(req: Request, { params }: Params) {
     );
   }
 
-  try {
-    await awardCustomBadge(
-      userId,
-      params.badgeId,
-      params.id,
-      session.user.id,
-      expiresAt ? new Date(expiresAt) : undefined
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 400 });
+  const existing = await prisma.userBadge.findFirst({
+    where: {
+      userId: body.userId,
+      badgeId: params.badgeId,
+      householdId: params.id,
+    },
+    select: { id: true },
+  });
+
+  const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+
+  let userBadge;
+  if (existing) {
+    userBadge = await prisma.userBadge.update({
+      where: { id: existing.id },
+      data: {
+        awardedByUserId: session.user.id,
+        awardedAt: new Date(),
+        expiresAt,
+      },
+    });
+  } else {
+    userBadge = await prisma.userBadge.create({
+      data: {
+        userId: body.userId,
+        badgeId: params.badgeId,
+        householdId: params.id,
+        awardedByUserId: session.user.id,
+        expiresAt,
+      },
+    });
   }
 
-  return NextResponse.json({ data: { awarded: true } });
+  return NextResponse.json({ data: userBadge });
 }

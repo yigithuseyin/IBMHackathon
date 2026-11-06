@@ -1,43 +1,51 @@
 import { prisma } from "@/lib/prisma";
 
+/** Idempotently create a UserBadge record if it doesn't already exist. */
+async function ensureUserBadge(
+  userId: string,
+  badgeId: string,
+  householdId: string
+): Promise<void> {
+  const existing = await prisma.userBadge.findFirst({
+    where: { userId, badgeId, householdId },
+    select: { id: true },
+  });
+  if (existing) return;
+  await prisma.userBadge.create({
+    data: { userId, badgeId, householdId },
+  });
+}
+
 /**
  * Called after every scoring event (chore completion/approval).
- * Checks milestone and behaviour badges and upserts any that are newly earned.
+ * Checks milestone and behaviour badges and awards any that are newly earned.
  */
 export async function checkAndAwardBadges(
   userId: string,
   householdId: string
 ): Promise<void> {
-  // Fetch data in parallel
-  const [completionCount, earlyCount, user, streak, existingBadges] =
-    await Promise.all([
-      prisma.choreCompletion.count({
-        where: { completedByUserId: userId, householdId },
-      }),
-      prisma.choreCompletion.count({
-        where: { completedByUserId: userId, householdId, wasEarly: true },
-      }),
-      prisma.user.findUnique({
-        where: { id: userId },
-        select: { totalPoints: true },
-      }),
-      prisma.userStreak.findUnique({
-        where: { userId_householdId: { userId, householdId } },
-        select: { currentStreak: true },
-      }),
-      prisma.userBadge.findMany({
-        where: { userId, householdId },
-        select: { badge: { select: { name: true } } },
-      }),
-    ]);
+  const [completionCount, earlyCount, user, streak] = await Promise.all([
+    prisma.choreCompletion.count({
+      where: { completedByUserId: userId, householdId },
+    }),
+    prisma.choreCompletion.count({
+      where: { completedByUserId: userId, householdId, wasEarly: true },
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { totalPoints: true },
+    }),
+    prisma.userStreak.findUnique({
+      where: { userId_householdId: { userId, householdId } },
+      select: { currentStreak: true },
+    }),
+  ]);
 
   const totalPoints = user?.totalPoints ?? 0;
   const currentStreak = streak?.currentStreak ?? 0;
-  const awardedNames = new Set(existingBadges.map((ub) => ub.badge.name));
 
-  // Build list of badge names this user qualifies for
+  // Build list of badge names this user now qualifies for
   const qualifiedNames: string[] = [];
-
   if (completionCount >= 1) qualifiedNames.push("First Step 🌟");
   if (completionCount >= 10) qualifiedNames.push("Getting Started 🚀");
   if (completionCount >= 50) qualifiedNames.push("Chore Champion 👑");
@@ -49,44 +57,39 @@ export async function checkAndAwardBadges(
   if (currentStreak >= 14) qualifiedNames.push("Unstoppable ⚡");
   if (earlyCount >= 5) qualifiedNames.push("Early Bird 🐦");
 
-  // Only process names not already awarded
-  const newNames = qualifiedNames.filter((n) => !awardedNames.has(n));
-  if (newNames.length === 0) return;
+  if (qualifiedNames.length === 0) return;
 
-  // Fetch badge records for the new ones
-  const badges = await prisma.badge.findMany({
-    where: { name: { in: newNames } },
-    select: { id: true, name: true },
-  });
+  // Fetch badge IDs and existing UserBadge records in parallel
+  const [badges, existingBadges] = await Promise.all([
+    prisma.badge.findMany({
+      where: { name: { in: qualifiedNames } },
+      select: { id: true, name: true },
+    }),
+    prisma.userBadge.findMany({
+      where: { userId, householdId },
+      select: { badgeId: true },
+    }),
+  ]);
 
-  // Upsert a UserBadge for each
+  const awardedBadgeIds = new Set(existingBadges.map((ub) => ub.badgeId));
+
   await Promise.all(
-    badges.map((badge) =>
-      prisma.userBadge.upsert({
-        where: {
-          // UserBadge has no unique constraint on (userId, badgeId, householdId),
-          // so we use findFirst + create pattern via upsert on id (always new id path)
-          // Fall back to create if the record doesn't exist yet.
-          id: "never-matches",
-        },
-        update: {},
-        create: {
-          userId,
-          badgeId: badge.id,
-          householdId,
-        },
-      }).catch(async () => {
-        // If upsert fails, try a plain create (ignore duplicate errors)
-        await prisma.userBadge
-          .create({ data: { userId, badgeId: badge.id, householdId } })
-          .catch(() => {});
-      })
-    )
+    badges
+      .filter((b) => !awardedBadgeIds.has(b.id))
+      .map((b) =>
+        prisma.userBadge
+          .create({ data: { userId, badgeId: b.id, householdId } })
+          .catch(() => {
+            // Swallow duplicate errors (race condition safety)
+          })
+      )
   );
 }
 
 /**
  * Called on household page load to apply/remove temporary badges for all members.
+ * Manages "Overdue ⚠️" and "Slacker 😴" badges only.
+ * "Exempt 🛡️" is managed separately in the member management route.
  */
 export async function applyTemporaryBadges(householdId: string): Promise<void> {
   const members = await prisma.householdMember.findMany({
@@ -95,8 +98,14 @@ export async function applyTemporaryBadges(householdId: string): Promise<void> {
   });
 
   const [overdueBadge, slackerBadge] = await Promise.all([
-    prisma.badge.findUnique({ where: { name: "Overdue ⚠️" }, select: { id: true } }),
-    prisma.badge.findUnique({ where: { name: "Slacker 😴" }, select: { id: true } }),
+    prisma.badge.findUnique({
+      where: { name: "Overdue ⚠️" },
+      select: { id: true },
+    }),
+    prisma.badge.findUnique({
+      where: { name: "Slacker 😴" },
+      select: { id: true },
+    }),
   ]);
 
   if (!overdueBadge || !slackerBadge) return;
@@ -107,23 +116,11 @@ export async function applyTemporaryBadges(householdId: string): Promise<void> {
     members.map(async ({ userId }) => {
       // --- Overdue badge ---
       const overdueCount = await prisma.chore.count({
-        where: {
-          householdId,
-          assignedToId: userId,
-          status: "OVERDUE",
-        },
+        where: { householdId, assignedToId: userId, status: "OVERDUE" },
       });
 
       if (overdueCount > 0) {
-        await prisma.userBadge.upsert({
-          where: { id: "never-matches" },
-          update: {},
-          create: { userId, badgeId: overdueBadge.id, householdId },
-        }).catch(async () => {
-          await prisma.userBadge
-            .create({ data: { userId, badgeId: overdueBadge.id, householdId } })
-            .catch(() => {});
-        });
+        await ensureUserBadge(userId, overdueBadge.id, householdId);
       } else {
         await prisma.userBadge.deleteMany({
           where: { userId, badgeId: overdueBadge.id, householdId },
@@ -140,20 +137,12 @@ export async function applyTemporaryBadges(householdId: string): Promise<void> {
         select: { id: true },
       });
 
-      const hasPendingChore = await prisma.chore.count({
+      const pendingChoreCount = await prisma.chore.count({
         where: { householdId, assignedToId: userId, status: "PENDING" },
       });
 
-      if (!recentCompletion && hasPendingChore > 0) {
-        await prisma.userBadge.upsert({
-          where: { id: "never-matches" },
-          update: {},
-          create: { userId, badgeId: slackerBadge.id, householdId },
-        }).catch(async () => {
-          await prisma.userBadge
-            .create({ data: { userId, badgeId: slackerBadge.id, householdId } })
-            .catch(() => {});
-        });
+      if (!recentCompletion && pendingChoreCount > 0) {
+        await ensureUserBadge(userId, slackerBadge.id, householdId);
       } else {
         await prisma.userBadge.deleteMany({
           where: { userId, badgeId: slackerBadge.id, householdId },

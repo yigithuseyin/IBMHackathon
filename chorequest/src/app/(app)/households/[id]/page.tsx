@@ -57,12 +57,32 @@ export default async function HouseholdPage({ params }: Props) {
     notFound();
   }
 
+  // Fetch active UserBadges for all members in this household
+  const userBadges = await prisma.userBadge.findMany({
+    where: { householdId: params.id },
+    select: {
+      userId: true,
+      badge: { select: { icon: true, name: true, isNegative: true } },
+    },
+  });
+
+  // Group badges by userId
+  const badgesByUserId: Record<
+    string,
+    { icon: string; name: string; isNegative: boolean }[]
+  > = {};
+  for (const ub of userBadges) {
+    if (!badgesByUserId[ub.userId]) badgesByUserId[ub.userId] = [];
+    badgesByUserId[ub.userId].push(ub.badge);
+  }
+
   const isOwner = household.ownerId === session.user.id;
   const isAdminOrOwner = isOwner || membership.role === "ADMIN";
 
   const navLinks = [
     { href: `/households/${params.id}/chores`, label: "Chores" },
     { href: `/households/${params.id}/members`, label: "Members" },
+    { href: `/households/${params.id}/badges`, label: "Badges" },
     { href: `/households/${params.id}/leaderboard`, label: "Leaderboard" },
     ...(isOwner
       ? [{ href: `/households/${params.id}/settings`, label: "Settings" }]
@@ -122,6 +142,7 @@ export default async function HouseholdPage({ params }: Props) {
               key={m.id}
               member={m.user}
               householdId={household.id}
+              badges={badgesByUserId[m.user.id] ?? []}
             />
           ))}
         </div>

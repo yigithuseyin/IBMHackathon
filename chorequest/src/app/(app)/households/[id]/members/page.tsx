@@ -2,8 +2,8 @@ import { redirect, notFound } from "next/navigation";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { hasPermission } from "@/lib/permissions";
-import { MemberRow } from "@/components/MemberRow";
+import { InviteCodeCopy } from "@/components/InviteCodeCopy";
+import { MemberManagement } from "@/components/MemberManagement";
 
 type Props = { params: { id: string } };
 
@@ -27,13 +27,12 @@ export default async function MembersPage({ params }: Props) {
 
   const household = await prisma.household.findUnique({
     where: { id: params.id },
-    select: { id: true, name: true },
+    select: { id: true, name: true, inviteCode: true },
   });
   if (!household) {
     notFound();
   }
 
-  // Fetch members directly via prisma (server component — no HTTP round-trip needed)
   const members = await prisma.householdMember.findMany({
     where: { householdId: params.id },
     select: {
@@ -59,10 +58,12 @@ export default async function MembersPage({ params }: Props) {
     orderBy: { joinedAt: "asc" },
   });
 
-  const canManage = hasPermission(requesterMembership, "canManageMembers");
-
-  const membersWithBadgeCount = members.map((m) => ({
-    ...m,
+  const membersData = members.map((m) => ({
+    id: m.id,
+    role: m.role,
+    permissions: m.permissions,
+    isExempt: m.isExempt,
+    joinedAt: m.joinedAt.toISOString(),
     badgesCount: m.user.badges.length,
     user: {
       id: m.user.id,
@@ -77,51 +78,27 @@ export default async function MembersPage({ params }: Props) {
     <div>
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">{household.name}</h1>
-        <p className="text-sm text-gray-500 mt-1">Members</p>
+        <h1 className="text-2xl font-bold text-gray-900">
+          Members — {household.name}
+        </h1>
       </div>
 
-      {/* Table */}
-      <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-12">
-                  Avatar
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Name
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Role
-                </th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Permissions
-                </th>
-                <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-20">
-                  Exempt
-                </th>
-                {canManage && (
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider w-20">
-                    Remove
-                  </th>
-                )}
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-100">
-              {membersWithBadgeCount.map((m) => (
-                <MemberRow
-                  key={m.id}
-                  member={m}
-                  householdId={params.id}
-                  canManage={canManage}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+      {/* Invite code section */}
+      <div className="mb-6 p-4 bg-indigo-50 border border-indigo-100 rounded-lg">
+        <p className="text-sm font-medium text-indigo-700 mb-2">
+          Invite Code — share this with people you want to join{" "}
+          <strong>{household.name}</strong>
+        </p>
+        <InviteCodeCopy inviteCode={household.inviteCode} />
       </div>
+
+      {/* Members table (client component handles interactivity) */}
+      <MemberManagement
+        initialMembers={membersData}
+        householdId={params.id}
+        sessionUserId={session.user.id}
+        sessionUserRole={requesterMembership.role}
+      />
     </div>
   );
 }
